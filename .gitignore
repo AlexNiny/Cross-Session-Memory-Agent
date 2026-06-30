@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.env.local
+.env*.local
+*.tsbuildinfo
+next-env.d.ts
+.memory-registry.json
+.local-memory.json
+.turn-registry.json
+.session-keys.json
+.storage-accounts.json
+.idx/
