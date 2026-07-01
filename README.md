@@ -70,6 +70,52 @@ This means a new browser can restore only turns that have already been backed up
 | LLM | Any OpenAI-compatible provider |
 | Wallet/auth | EVM wallet signature + HTTP-only app session |
 
+## How to Use
+
+### 1. Sign in with a wallet
+
+Open the app and click **Connect wallet**. The app asks the wallet to sign a login challenge and then creates an HTTP-only application session.
+
+### 2. Configure your LLM provider
+
+Open **Settings** and enter:
+
+- Provider URL, for example `https://openrouter.ai/api/v1` or another OpenAI-compatible endpoint
+- Model name
+- API key
+
+The provider URL and model are stored in D1. The API key is encrypted before it is stored.
+
+### 3. Prepare Filecoin storage
+
+Use the faucet buttons in the app, or open these directly:
+
+- [Get Calibration tFIL](https://faucet.calibnet.chainsafe-fil.io/funds.html)
+- [Get Calibration USDFC](https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc)
+
+Then click **Authorize storage** in the chat UI, or use the funding controls on the **Profile** page. The app creates and authorizes a Filecoin session key so backups can run without repeated wallet popups.
+
+### 4. Chat normally
+
+Start a session and send messages. Completed user/assistant turns are saved in browser `localStorage` first. They are not written to D1.
+
+Each LLM request uses the provider URL and API key configured by the signed-in user.
+
+### 5. Back up memory to Filecoin
+
+The app can back up turns in two ways:
+
+- Automatic backup: runs when pending local turns reach the configured **Backup cadence**.
+- Manual backup: use **Backup now** for the current session or **Backup all local sessions** for all browser-local sessions.
+
+Backups are queued asynchronously so chat responses are not blocked by Filecoin upload work. After a successful upload, the Memory page shows the latest PieceCID and backup history.
+
+### 6. Restore on another browser or device
+
+Open the app somewhere else and sign in with the same wallet. The app reads the D1 Filecoin registry, downloads the indexed pieces from Filecoin, and reconstructs backed-up conversations locally.
+
+Only turns already backed up to Filecoin can be restored on a new browser. Turns that exist only in one browser's `localStorage` stay local until backed up.
+
 ## Local Development
 
 Install dependencies:
@@ -143,16 +189,6 @@ The app uses Filecoin Calibration for demo storage. Test users need:
 - USDFC for storage payments: [Calibration USDFC faucet](https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc)
 
 The UI also links to both faucets from the chat and profile screens.
-
-## User Flow
-
-1. Connect wallet and sign the login challenge.
-2. Configure provider URL, model, and API key in Settings.
-3. Authorize Filecoin storage from the app.
-4. Chat normally. Turns are saved locally.
-5. Automatic backup queues when pending local turns reach the configured cadence.
-6. Manual backup can upload the current session or all local sessions.
-7. On another browser, sign in with the same wallet. The app reads D1's Filecoin registry and restores backed-up turns from Filecoin.
 
 ## Project Structure
 
