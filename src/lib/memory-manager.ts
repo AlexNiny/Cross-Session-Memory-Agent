@@ -1,8 +1,9 @@
 import 'server-only';
 import fs from 'node:fs';
 import path from 'node:path';
-import { config } from './config';
+import { getFilecoinProviderIds, getFilecoinStorageCopies } from './config';
 import { checkAuthorization, createWalletSynapse } from './synapse';
+import type { FilecoinBackupQueueMessage } from './cloudflare-env';
 import type { D1Database } from './cloudflare-env';
 
 export interface ChatTurn {
@@ -67,6 +68,12 @@ export interface BackupResult {
 class FilecoinMemoryStore {
   async initialize(): Promise<void> {}
 
+  private extractFailedProviderId(err: unknown): bigint | null {
+    const message = err instanceof Error ? err.message : String(err);
+    const match = message.match(/primary provider\s+(\d+)/i) || message.match(/provider\s+(\d+)/i);
+    return match ? BigInt(match[1]) : null;
+  }
+
   private appendParsedTurns(target: ChatTurn[], sessionId: string, parsed: unknown): void {
     if (!parsed || typeof parsed !== 'object') return;
     const payload = parsed as {
@@ -113,14 +120,57 @@ class FilecoinMemoryStore {
     return /HTTP request failed|fetch failed|network|timeout/i.test(message);
   }
 
+  private isPartialCommitError(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    return /data is stored but not on-chain|Failed to commit on primary provider|Failed to commit pieces on-chain|StorageContext commit failed/i.test(message);
+  }
+
   private async withRpcRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (err) {
       if (!this.isTransientRpcError(err)) throw err;
+      if (label === 'upload' && this.isPartialCommitError(err)) {
+        console.warn(`[CSMA-Filecoin] ${label} reached provider but commit failed; trying alternate provider path:`, err instanceof Error ? err.message : err);
+        throw err;
+      }
       console.warn(`[CSMA-Filecoin] ${label} RPC failed, retrying once:`, err instanceof Error ? err.message : err);
       await new Promise((resolve) => setTimeout(resolve, 750));
       return fn();
+    }
+  }
+
+  private async uploadWithProviderFallback(synapse: Awaited<ReturnType<typeof createWalletSynapse>>['synapse'], data: Uint8Array) {
+    const configuredProviderIds = await getFilecoinProviderIds();
+    const storageCopies = await getFilecoinStorageCopies();
+    console.log(
+      '[CSMA-Filecoin] configured providers:',
+      configuredProviderIds.length > 0 ? configuredProviderIds.map((id) => id.toString()).join(',') : 'auto',
+      ', copies:',
+      storageCopies,
+    );
+    const uploadOptions = (providerIds: bigint[]) => ({
+      copies: storageCopies,
+      ...(providerIds.length > 0 ? { providerIds } : {}),
+      callbacks: {
+        onProviderSelected: (provider: { id: bigint; pdp?: { serviceURL?: string } }) => {
+          console.log('[CSMA-Filecoin] selected provider:', provider.id.toString(), provider.pdp?.serviceURL || '');
+        },
+      },
+    });
+
+    try {
+      return await this.withRpcRetry('upload', () => synapse.storage.upload(data, uploadOptions(configuredProviderIds)));
+    } catch (err) {
+      if (!this.isPartialCommitError(err)) throw err;
+      const failedProviderId = this.extractFailedProviderId(err);
+      if (failedProviderId == null || configuredProviderIds.length === 0) throw err;
+
+      const nextProviderIds = configuredProviderIds.filter((id) => id !== failedProviderId);
+      if (nextProviderIds.length === configuredProviderIds.length || nextProviderIds.length === 0) throw err;
+
+      console.warn('[CSMA-Filecoin] retrying upload with configured provider removed:', failedProviderId.toString());
+      return await this.withRpcRetry('upload-alt-provider', () => synapse.storage.upload(data, uploadOptions(nextProviderIds)));
     }
   }
 
@@ -316,7 +366,7 @@ class FilecoinMemoryStore {
       }
 
       console.log('[CSMA-Filecoin] uploading...');
-      const result = await this.withRpcRetry('upload', () => synapse.storage.upload(data));
+      const result = await this.uploadWithProviderFallback(synapse, data);
       console.log('[CSMA-Filecoin] upload OK — PieceCID:', result.pieceCid, ', copies:', result.copies.length);
       const primaryCopy = result.copies[0];
       const existing = await this.readRegistryEntry(sessionId, ownerId);
@@ -479,6 +529,23 @@ function nextTurnIndex(turns: ChatTurn[]): number {
   return Math.max(...turns.map((turn) => turn.turnIndex)) + 1;
 }
 
+function backupQueueMessage(
+  source: FilecoinBackupQueueMessage['source'],
+  sessionId: string,
+  walletAddress: `0x${string}`,
+  turns: ChatTurn[],
+  ownerId?: string,
+): FilecoinBackupQueueMessage {
+  return {
+    kind: 'filecoin-backup',
+    source,
+    sessionId,
+    walletAddress,
+    ownerId,
+    turns: normalizeChatTurns(turns),
+  };
+}
+
 export class MemoryManager {
   private filecoin: FilecoinMemoryStore;
   private local: LocalMemoryStore;
@@ -530,24 +597,16 @@ export class MemoryManager {
       const pendingTurns = await this.filecoin.getPendingTurns(sessionId, localTurns, ownerId);
       console.log('[CSMA-Filecoin] auto backup check: pending=' + pendingTurns.length + ', threshold=' + threshold);
       if (pendingTurns.length >= threshold) {
-        const backupPromise = this.filecoin.backupTurns(sessionId, localTurns, addr, ownerId)
-          .then((result) => {
-            if (result.uploaded) {
-              console.log('[CSMA-Filecoin] async backup complete: session=' + sessionId.slice(0, 8) + '..., turns=' + result.turnIndexes.length);
-            } else if (result.reason) {
-              console.warn('[CSMA-Filecoin] async backup skipped/failed: session=' + sessionId.slice(0, 8) + '..., reason=' + result.reason);
-            }
-          });
-        const { scheduleBackgroundTask } = await import('./cloudflare-env');
-        await scheduleBackgroundTask('filecoin-auto-backup', backupPromise);
+        const { enqueueFilecoinBackup } = await import('./cloudflare-env');
+        const queued = await enqueueFilecoinBackup(backupQueueMessage('auto', sessionId, addr, localTurns, ownerId));
         return {
           uploaded: false,
-          queued: true,
+          queued,
           sessionId,
           pendingCount: pendingTurns.length,
           syncedCount: localTurns.length - pendingTurns.length,
           turnIndexes: pendingTurns.map((pendingTurn) => pendingTurn.turnIndex),
-          reason: 'Backup queued',
+          reason: queued ? 'Backup queued' : 'FILECOIN_BACKUP_QUEUE binding is not configured',
         };
       }
     }
@@ -632,26 +691,44 @@ export class MemoryManager {
       };
     }
 
-    const backupPromise = this.filecoin.backupTurns(sessionId, localTurns, addr, ownerId)
-      .then((result) => {
-        if (result.uploaded) {
-          console.log('[CSMA-Filecoin] manual backup complete: session=' + sessionId.slice(0, 8) + '..., turns=' + result.turnIndexes.length);
-        } else if (result.reason) {
-          console.warn('[CSMA-Filecoin] manual backup skipped/failed: session=' + sessionId.slice(0, 8) + '..., reason=' + result.reason);
-        }
-      });
-    const { scheduleBackgroundTask } = await import('./cloudflare-env');
-    await scheduleBackgroundTask('filecoin-manual-backup', backupPromise);
+    const { enqueueFilecoinBackup } = await import('./cloudflare-env');
+    const queued = await enqueueFilecoinBackup(backupQueueMessage('manual', sessionId, addr, localTurns, ownerId));
 
     return {
       uploaded: false,
-      queued: true,
+      queued,
       sessionId,
       pendingCount: pendingTurns.length,
       syncedCount: localTurns.length - pendingTurns.length,
       turnIndexes: pendingTurns.map((turn) => turn.turnIndex),
-      reason: 'Backup queued',
+      reason: queued ? 'Backup queued' : 'FILECOIN_BACKUP_QUEUE binding is not configured',
     };
+  }
+
+  async processQueuedBackup(message: FilecoinBackupQueueMessage): Promise<BackupResult> {
+    if (message.kind !== 'filecoin-backup') {
+      throw new Error('Unsupported backup queue message.');
+    }
+    const addr = message.walletAddress as `0x${string}`;
+    if (!await checkAuthorization(addr)) {
+      return {
+        uploaded: false,
+        sessionId: message.sessionId,
+        pendingCount: 0,
+        syncedCount: 0,
+        turnIndexes: [],
+        reason: 'Session key not authorized',
+      };
+    }
+    const turns = normalizeChatTurns(message.turns);
+    console.log('[CSMA-Filecoin] queue backup start: source=' + message.source + ', session=' + message.sessionId.slice(0, 8) + '..., turns=' + turns.length);
+    const result = await this.filecoin.backupTurns(message.sessionId, turns, addr, message.ownerId);
+    if (result.uploaded) {
+      console.log('[CSMA-Filecoin] queue backup complete: session=' + message.sessionId.slice(0, 8) + '..., turns=' + result.turnIndexes.length);
+    } else if (result.reason) {
+      console.warn('[CSMA-Filecoin] queue backup skipped/failed: session=' + message.sessionId.slice(0, 8) + '..., reason=' + result.reason);
+    }
+    return result;
   }
 
   async getBackupStatus(sessionId: string, ownerId?: string): Promise<{ pendingCount: number; syncedCount: number; localCount: number }> {

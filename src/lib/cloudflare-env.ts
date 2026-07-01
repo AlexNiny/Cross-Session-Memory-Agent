@@ -20,20 +20,40 @@ export interface D1Database {
   exec(query: string): Promise<D1Result>;
 }
 
+export interface QueueBinding<T = unknown> {
+  send(message: T): Promise<void>;
+}
+
+export interface FilecoinBackupQueueMessage {
+  kind: 'filecoin-backup';
+  source: 'auto' | 'manual';
+  sessionId: string;
+  walletAddress: string;
+  ownerId?: string;
+  turns: Array<{
+    turnIndex: number;
+    userMessage: string;
+    agentResponse: string;
+    timestamp: number;
+  }>;
+}
+
 export interface AppCloudflareEnv {
   DB?: D1Database;
+  FILECOIN_BACKUP_QUEUE?: QueueBinding<FilecoinBackupQueueMessage>;
   APP_ENCRYPTION_KEY?: string;
   SESSION_SECRET?: string;
   ALLOW_UNSAFE_PROVIDER_URLS?: string;
-}
-
-interface CloudflareExecutionContext {
-  waitUntil(promise: Promise<unknown>): void;
+  FILECOIN_PROVIDER_IDS?: string;
+  FILECOIN_STORAGE_COPIES?: string;
+  FILECOIN_RPC_URL?: string;
+  FILECOIN_RPC_URLS?: string;
+  SYNAPSE_SOURCE?: string;
+  MEMORY_LIMIT?: string;
 }
 
 interface CloudflareContext {
   env?: AppCloudflareEnv;
-  ctx?: CloudflareExecutionContext;
 }
 
 async function getCloudflareContextData(): Promise<CloudflareContext> {
@@ -55,6 +75,12 @@ export async function getCloudflareEnv(): Promise<AppCloudflareEnv> {
     APP_ENCRYPTION_KEY: processEnv.APP_ENCRYPTION_KEY,
     SESSION_SECRET: processEnv.SESSION_SECRET,
     ALLOW_UNSAFE_PROVIDER_URLS: processEnv.ALLOW_UNSAFE_PROVIDER_URLS,
+    FILECOIN_PROVIDER_IDS: processEnv.FILECOIN_PROVIDER_IDS,
+    FILECOIN_STORAGE_COPIES: processEnv.FILECOIN_STORAGE_COPIES,
+    FILECOIN_RPC_URL: processEnv.FILECOIN_RPC_URL,
+    FILECOIN_RPC_URLS: processEnv.FILECOIN_RPC_URLS,
+    SYNAPSE_SOURCE: processEnv.SYNAPSE_SOURCE,
+    MEMORY_LIMIT: processEnv.MEMORY_LIMIT,
   };
 
   const context = await getCloudflareContextData();
@@ -63,19 +89,11 @@ export async function getCloudflareEnv(): Promise<AppCloudflareEnv> {
   return env;
 }
 
-export async function scheduleBackgroundTask(label: string, promise: Promise<unknown>): Promise<void> {
-  const guarded = promise.catch((err) => {
-    console.error(`[CSMA-Background] ${label} failed:`, err);
-  });
-  const context = await getCloudflareContextData();
-  if (context.ctx?.waitUntil) {
-    context.ctx.waitUntil(guarded);
-    return;
-  }
-
-  // Local Node fallback: keep the promise observed so failures do not become
-  // unhandled rejections. Workers should use ctx.waitUntil above.
-  void guarded;
+export async function enqueueFilecoinBackup(message: FilecoinBackupQueueMessage): Promise<boolean> {
+  const env = await getCloudflareEnv();
+  if (!env.FILECOIN_BACKUP_QUEUE) return false;
+  await env.FILECOIN_BACKUP_QUEUE.send(message);
+  return true;
 }
 
 export async function getD1(): Promise<D1Database> {

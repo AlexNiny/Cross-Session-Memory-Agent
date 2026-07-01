@@ -110,6 +110,8 @@ The app can back up turns in two ways:
 
 Backups are queued asynchronously so chat responses are not blocked by Filecoin upload work. After a successful upload, the Memory page shows the latest PieceCID and backup history.
 
+On Cloudflare, Filecoin backup work is processed by Cloudflare Queues instead of `ctx.waitUntil()`. This avoids the 30-second post-response `waitUntil()` limit for long Filecoin prepare/upload operations.
+
 ### 6. Restore on another browser or device
 
 Open the app somewhere else and sign in with the same wallet. The app reads the D1 Filecoin registry, downloads the indexed pieces from Filecoin, and reconstructs backed-up conversations locally.
@@ -161,6 +163,12 @@ wrangler d1 create cross-session-memory-agent
 
 Copy the returned `database_id` into `wrangler.jsonc`.
 
+Create the Filecoin backup queue:
+
+```bash
+wrangler queues create filecoin-backups
+```
+
 Set production secrets:
 
 ```bash
@@ -180,6 +188,19 @@ Build and deploy:
 pnpm cf:build
 pnpm cf:deploy
 ```
+
+The Worker entrypoint is `worker.mjs`, which wraps the OpenNext Worker for HTTP requests and exports a Queue consumer for Filecoin backup jobs.
+
+### Filecoin Provider Tuning
+
+If you want to use only specific Calibration PDP providers during upload, set:
+
+```bash
+FILECOIN_PROVIDER_IDS=1,2
+FILECOIN_STORAGE_COPIES=2
+```
+
+`FILECOIN_PROVIDER_IDS` is a comma-separated allowlist of provider IDs. Leave it empty to let Synapse choose providers automatically. When a configured primary provider returns `data is stored but not on-chain` / `Failed to commit pieces on-chain`, the backup worker retries once using the remaining configured providers.
 
 ## Filecoin Test Funds
 

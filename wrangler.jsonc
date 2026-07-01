@@ -1,23 +1,58 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cross-session-memory-agent",
-  "main": ".open-next/worker.js",
-  "compatibility_date": "2026-07-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "assets": {
-    "directory": ".open-next/assets",
-    "binding": "ASSETS"
-  },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "cross-session-memory-agent",
-      "database_id": "replace-with-your-d1-database-id",
-      "migrations_dir": "migrations"
-    }
-  ],
-  "vars": {
-    "SYNAPSE_SOURCE": "cross-session-memory-agent",
-    "MEMORY_LIMIT": "10"
-  }
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cross-session-memory-agent",
+	"main": "worker.mjs",
+	"compatibility_date": "2026-07-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": false,
+		"head_sampling_rate": 1,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"persist": true,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": false,
+			"persist": true,
+			"head_sampling_rate": 1
+		}
+	},
+	"assets": {
+		"directory": ".open-next/assets",
+		"binding": "ASSETS"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "cross-session-memory-agent",
+			"database_id": "",
+			"migrations_dir": "migrations"
+		}
+	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "FILECOIN_BACKUP_QUEUE",
+				"queue": "filecoin-backups"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "filecoin-backups",
+				"max_batch_size": 1,
+				"max_batch_timeout": 5,
+				"max_retries": 3
+			}
+		]
+	},
+	"vars": {
+		"SYNAPSE_SOURCE": "cross-session-memory-agent",
+		"FILECOIN_PROVIDER_IDS": "2,9",
+		"FILECOIN_STORAGE_COPIES": "2",
+		"MEMORY_LIMIT": "10"
+	}
 }
