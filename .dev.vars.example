@@ -1,9 +1,11 @@
-SESSION_SECRET="replace-with-at-least-32-random-characters"
-APP_ENCRYPTION_KEY="replace-with-another-32-random-character-secret"
+SESSION_SECRET=""
+APP_ENCRYPTION_KEY=""
 
 # Set to true only for local development with localhost/self-hosted LLMs.
 ALLOW_UNSAFE_PROVIDER_URLS="false"
 
 FILECOIN_RPC_URL="https://api.calibration.node.glif.io/rpc/v1"
+FILECOIN_PROVIDER_IDS=""
+FILECOIN_STORAGE_COPIES="2"
 SYNAPSE_SOURCE="cross-session-memory-agent"
 MEMORY_LIMIT="10"
