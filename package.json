@@ -7,12 +7,18 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:preview": "opennextjs-cloudflare build && wrangler dev",
+    "cf:deploy": "opennextjs-cloudflare build && wrangler deploy",
+    "d1:migrate:local": "wrangler d1 migrations apply cross-session-memory-agent --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply cross-session-memory-agent --remote"
   },
   "dependencies": {
     "@filoz/synapse-core": "^0.7.0",
     "@filoz/synapse-sdk": "^1.0.0",
-    "next": "^14.2.0",
+    "@opennextjs/cloudflare": "^1.20.1",
+    "next": "^15.5.18",
     "openai": "^6.45.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
@@ -26,9 +32,10 @@
     "@types/uuid": "^10.0.0",
     "autoprefixer": "^10.4.0",
     "eslint": "^9.0.0",
-    "eslint-config-next": "^14.2.0",
+    "eslint-config-next": "^15.5.18",
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "wrangler": "^4.105.0"
   }
 }
