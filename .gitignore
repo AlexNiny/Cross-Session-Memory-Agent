@@ -5,6 +5,7 @@ node_modules/
 *.tsbuildinfo
 next-env.d.ts
 .idx/
+.idea/
 .open-next/
 .dev.vars
 .wrangler/

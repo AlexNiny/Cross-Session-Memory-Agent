@@ -1,215 +1,136 @@
-# Cross-Session Memory Agent — Project Spec (Final)
+# Cross-Session Memory Agent - Product Overview
 
-## 🎯 Target Bounty
-**FilecoinTLDR Cycle 2**: "Build an AI Agent That Uses Filecoin"
-- Deadline: July 10, 2026 (5-day build window)
-- Theme: AI agent using Filecoin for memory/logs/datasets/storage
+## One-Liner
 
----
+Cross-Session Memory Agent is a wallet-authenticated AI chat app that gives users portable, Filecoin-backed conversation memory while keeping chat bodies out of the application database.
 
-## 📋 Project Overview
+## Product Description
 
-**Name**: Cross-Session Memory Agent  
-**Tagline**: An AI chat agent that permanently stores conversation memory on Filecoin for contextual recall across sessions.
+Most AI chat products treat memory as either temporary browser state or centralized account data. Cross-Session Memory Agent takes a different approach: the user's wallet is the identity layer, their own LLM provider handles generation, and Filecoin stores backed-up conversation memory for cross-browser and cross-device recovery.
 
-**Description**:  
-Most AI agents forget conversations after the session ends. This agent writes every user interaction to Filecoin storage, creating a persistent memory layer. When a user returns, the agent retrieves relevant historical context and resumes as if it "remembers" the past. This demonstrates a real Filecoin use case beyond basic storage—it enables stateful AI experiences with decentralized memory.
+The app is designed for Cloudflare Workers and Cloudflare D1. D1 stores user accounts, encrypted provider configuration, encrypted Filecoin session keys, and Filecoin memory indexes such as dataset IDs, PieceCIDs, synced turn indexes, and backup history. D1 does not store chat message bodies. Chat text stays in browser local storage until it is backed up to Filecoin as batched pieces.
 
-**Key Innovation**:
-- **Silent Auth**: Uses session keys for automated signing (no wallet popups)
-- **Chunked Memory**: Breaks chat history into datasets for efficient retrieval
-- **Context Injection**: Feeds retrieved memory directly into LLM prompt context
+## Why This Matters
 
----
+AI memory is valuable because it makes assistants more useful over time. But memory is also sensitive. A simple server-side chat history table creates a tempting central store of private user conversations.
 
-## 🏗 Technical Architecture
+This project demonstrates a more privacy-conscious memory architecture:
 
-```mermaid
-flowchart TD
-  User[User Chat Interface] --> Agent[AI Agent Orchestrator]
-  Agent --> Context[Context Builder]
-  Context --> LLM[LLM API]
-  LLM --> Response[Response to User]
-  
-  Agent --> MemoryManager[Memory Manager]
-  MemoryManager --> Filecoin[(Filecoin Storage)]
-  Filecoin --> Query[History Query]
-  Query --> Context
-  
-  MemoryManager <--> SessionKey[Session Key Auth]
-  SessionKey --> Registry[SessionKeyRegistry Contract]
+- Users authenticate with a wallet rather than a platform-owned password account.
+- Users bring their own OpenAI-compatible LLM provider.
+- API keys and Filecoin session keys are encrypted before being stored in D1.
+- Conversation content is not stored in D1.
+- Filecoin provides durable storage for memory that should survive a tab, browser, or device.
+- D1 acts as an index, not a plaintext memory warehouse.
+
+## What's Novel
+
+The core novelty is the split-storage model:
+
+| Layer | Responsibility |
+| --- | --- |
+| Browser local storage | Immediate local transcript and pending turns |
+| Cloudflare D1 | Auth, encrypted config, encrypted session keys, Filecoin indexes |
+| Filecoin | Durable conversation memory pieces |
+| User LLM provider | Per-user model inference |
+
+This creates cross-session recovery without turning the app database into a chat-history database. A second browser can sign in with the same wallet, read the D1 Filecoin registry, fetch the latest PieceCIDs from Filecoin, and reconstruct the backed-up conversation.
+
+## Target Users
+
+- Builders experimenting with decentralized AI memory.
+- Hackathon judges evaluating practical Filecoin usage.
+- Users who want AI chat memory without handing the app operator a plaintext database of conversations.
+- Developers who want a Cloudflare-native reference for wallet login, encrypted user settings, and Filecoin-backed data recovery.
+
+## Key Features
+
+- Wallet signature login with HTTP-only application sessions.
+- Per-user provider URL, model, and encrypted API key.
+- OpenAI-compatible chat completion support.
+- Filecoin storage authorization using session keys.
+- Automatic Filecoin backup cadence.
+- Manual backup for the current session or all local sessions.
+- Memory page showing latest CID and backup history.
+- Cross-device restore using D1 registry plus Filecoin PieceCID downloads.
+- D1 migration that removes the early `chat_turns` table so D1 remains index/config only.
+- Test-fund links for Calibration tFIL and USDFC.
+
+## User Journey
+
+1. User opens the app and connects a wallet.
+2. User signs a login challenge.
+3. User configures their LLM provider URL, model, and API key.
+4. User authorizes Filecoin storage and funds the storage account.
+5. User chats normally. Turns are saved locally first.
+6. The app queues Filecoin backups automatically after the configured cadence, or the user starts a manual backup.
+7. The app records Filecoin dataset IDs, PieceCIDs, and synced turn indexes in D1.
+8. On another browser, the same wallet signs in and the app restores backed-up turns from Filecoin.
+
+## Architecture
+
+```text
+Wallet-authenticated browser
+  - local transcript
+  - provider/settings UI
+  - backup and restore controls
+        |
+        v
+Cloudflare Worker via OpenNext
+  - auth APIs
+  - chat API
+  - memory backup/restore APIs
+  - provider config APIs
+        |
+        +--> Cloudflare D1
+        |     - users
+        |     - auth nonces and sessions
+        |     - encrypted provider API keys
+        |     - encrypted Filecoin session keys
+        |     - Filecoin memory registry and CIDs
+        |
+        +--> User's OpenAI-compatible provider
+        |
+        +--> Filecoin via Synapse SDK
+              - batched chat turns
+              - PieceCID-based restore
 ```
 
-**Data Flow**:
-1. User inputs chat → Agent receives
-2. Save new turn → Filecoin (Dataset + Pieces)
-3. Retrieve past turns → Filter by session ID
-4. Inject memory into LLM prompt → Generate response
-5. Repeat with enriched context
+## Data Policy
 
----
+D1 stores:
 
-## 💾 Filecoin Cloud API Integration
+- Wallet-linked user rows.
+- Login challenges and sessions.
+- Provider URL and model.
+- Encrypted provider API key.
+- Encrypted Filecoin session private key.
+- Filecoin memory registry entries.
 
-### Authentication Flow (Per Session Key Docs)
+D1 does not store:
 
-**Step 1: Generate Session Keypair**
-```typescript
-import { generateSessionKeypair } from '@filoz/synapse-sdk/core';
+- User chat messages.
+- Assistant chat responses.
+- Plaintext provider API keys.
+- Plaintext Filecoin session private keys.
 
-const keypair = await generateSessionKeypair({
-  rootAccount: userRootAccount, // Owner wallet
-  permissions: ['CreateDataSetPermission', 'AddPiecesPermission']
-});
-```
+## Demo Narrative
 
-**Step 2: Login (Register Authorization)**
-```typescript
-import { loginSync } from '@filoz/synapse-sdk/core';
+The best demo is a two-browser flow:
 
-// Set expiry to cover entire hackathon window (6 days)
-const expiry = BigInt(Math.floor(Date.now() / 1000) + 518400);
+1. Browser A signs in, chats for a few turns, and backs up to Filecoin.
+2. The app displays the latest PieceCID and backup history.
+3. Browser B signs in with the same wallet.
+4. Browser B loads the D1 memory registry, downloads the Filecoin pieces, and restores the conversation.
+5. The next LLM response uses restored memory as prompt context.
 
-await loginSync({
-  sessionKey: keypair.address,
-  rootClient: rootClient,
-  expiry: expiry
-});
-```
+## Current Status
 
-**Step 3: Use Session Key for API Calls**
-```typescript
-import { synapse } from '@filoz/synapse-sdk';
+The project is implemented as a Cloudflare-ready Next.js application with D1 migrations, OpenNext Worker build support, wallet authentication, encrypted user configuration, Filecoin backup/restore, and a refreshed README for deployment.
 
-const agentClient = synapse.initialize({
-  sessionKey: keypair, // Silent signing enabled
-  chain: 'calibration' // Testnet
-});
+## Known Constraints
 
-// Now write to Filecoin without popups
-await agentClient.createDataset({ payload: chatData });
-```
-
-### REST API Endpoints (Cloud Platform)
-
-*Note: Authenticated via Session Key headers automatically handled by SDK*
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/datasets` | POST | Create new dataset |
-| `/datasets/{cid}/pieces` | POST | Add data pieces to dataset |
-| `/datasets/{cid}?filter={sessionId}` | GET | Query stored memory |
-| `/datasets/{cid}/publish` | POST | Make globally retrievable |
-
-**Authentication Header**: SDK injects Bearer token using session key signature automatically.
-
----
-
-## 🧠 Agent Logic Implementation
-
-```typescript
-// Core agent loop
-class MemoryAgent {
-  private memoryManager: MemoryManager;
-  private llmClient: LLMClient;
-  
-  constructor() {
-    this.memoryManager = new MemoryManager(); // Handles Filecoin I/O
-    this.llmClient = new LLMClient(); // Anthropic/Claude API
-  }
-  
-  async handleUserMessage(sessionId: string, message: string): Promise<string> {
-    // 1. Retrieve historical context
-    const history = await this.memoryManager.getHistory(sessionId, { limit: 5 });
-    
-    // 2. Build context-aware prompt
-    const prompt = this.buildContextualPrompt(message, history);
-    
-    // 3. Get LLM response
-    const response = await this.llmClient.chat(prompt);
-    
-    // 4. Save both user & agent messages to Filecoin
-    await this.memoryManager.saveTurn({
-      sessionId,
-      turnIndex: history.length,
-      userMessage: message,
-      agentResponse: response
-    });
-    
-    return response;
-  }
-  
-  private buildContextualPrompt(newMessage: string, history: MemoryItem[]): string {
-    return `
-You are a helpful AI assistant. Here's what the user has discussed with you previously:
-${history.map(h => `Turn ${h.turnIndex}: ${h.userMessage}`).join('\n')}
-
-Current user message: "${newMessage}"
-
-Provide a response that acknowledges their history and continues the conversation.
-    `.trim();
-  }
-}
-```
-
----
-
-## ⏱ 5-Day Build Plan (Hourly Breakdown)
-
-### Day 1 (Hours 0-8): Setup
-- **0-1**: Fork repo, install dependencies (`npm install @filoz/synapse-sdk`)
-- **1-2**: Generate session keypair, register on Calibration testnet
-- **2-3**: Test dataset creation + piece upload
-- **3-5**: Build basic LLM client (Claude API)
-- **5-8**: Integrate memory save/retrieve functions
-
-### Day 2 (Hours 9-16): Core Agent
-- **9-10**: Create basic chat interface (Next.js page)
-- **10-12**: Wire agent loop with message handling
-- **12-14**: Implement context injection logic
-- **14-16**: Test multi-turn conversation with memory persistence
-
-### Day 3 (Hours 17-24): Optimization
-- **17-18**: Add error handling + retry logic
-- **18-20**: Optimize context size (chunking, token limits)
-- **20-22**: Deploy web interface (Vercel/Netlify)
-- **22-24**: Record demo video (walkthrough with live interaction)
-
-### Day 4 (Hours 25-32): Polish
-- **25-26**: Create X post (include demo link + screenshot)
-- **26-27**: Write AI build log (how Claude Code helped)
-- **27-28**: Final testing (stress test with long conversations)
-- **28-32**: Prepare submission materials
-
-### Day 5 (Hours 33-40): Submission
-- **33-34**: Final demo validation
-- **34-35**: Submit to hackathon (demo link, repo, X post)
-- **35-40**: Optional: Extend features, add more polish
-
----
-
-## 🎯 Judging Criteria Checklist
-
-- ✅ **Meaningful Filecoin Use**: Memory stored on chain (30%)
-- ✅ **Working Demo**: Live chat with persistence (25%)
-- ✅ **Creativity**: Cross-session context (20%)
-- ✅ **AI-Guided Build**: Include build log (10%)
-- ✅ **Public Showcase**: X post with demo + tags (15%)
-
----
-
-## 🛠 Tech Stack Summary
-
-| Component | Technology |
-|-----------|------------|
-| **LLM** | Anthropic Claude 3 API |
-| **Storage** | Filecoin Cloud (Synapse SDK) |
-| **Auth** | Session Keys (6-day expiry) |
-| **Frontend** | Next.js + Vercel |
-| **Testing** | Vitest + Playwright |
-| **Hosting** | Vercel (free tier) |
-
----
-
-**Status**: This is a production-ready spec ready to copy into your repo.  
-**Next**: Start Day 1—generate session keys and test Filecoin storage I/O. 🚀
+- A new browser can only restore turns that have already been backed up to Filecoin.
+- Production requires Cloudflare secrets for `SESSION_SECRET` and `APP_ENCRYPTION_KEY`.
+- The deployed D1 database must run all migrations, including the migration that drops the old `chat_turns` table.
+- Filecoin backup requires Calibration tFIL and USDFC funding during testing.
