@@ -29,7 +29,7 @@
 		{
 			"binding": "DB",
 			"database_name": "cross-session-memory-agent",
-			"database_id": "",
+			"database_id": "2e1b7580-f187-4a0d-9650-d81de0e5ee6b",
 			"migrations_dir": "migrations"
 		}
 	],
@@ -51,8 +51,8 @@
 	},
 	"vars": {
 		"SYNAPSE_SOURCE": "cross-session-memory-agent",
-		"FILECOIN_PROVIDER_IDS": "2,9",
-		"FILECOIN_STORAGE_COPIES": "2",
+		"FILECOIN_PROVIDER_ID": "2",
+		"FILECOIN_STORAGE_COPIES": "1",
 		"MEMORY_LIMIT": "10"
 	}
 }

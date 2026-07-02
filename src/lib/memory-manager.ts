@@ -1,7 +1,7 @@
 import 'server-only';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getFilecoinProviderIds, getFilecoinStorageCopies } from './config';
+import { getFilecoinProviderId, getFilecoinStorageCopies } from './config';
 import { checkAuthorization, createWalletSynapse } from './synapse';
 import type { FilecoinBackupQueueMessage } from './cloudflare-env';
 import type { D1Database } from './cloudflare-env';
@@ -68,12 +68,6 @@ export interface BackupResult {
 class FilecoinMemoryStore {
   async initialize(): Promise<void> {}
 
-  private extractFailedProviderId(err: unknown): bigint | null {
-    const message = err instanceof Error ? err.message : String(err);
-    const match = message.match(/primary provider\s+(\d+)/i) || message.match(/provider\s+(\d+)/i);
-    return match ? BigInt(match[1]) : null;
-  }
-
   private appendParsedTurns(target: ChatTurn[], sessionId: string, parsed: unknown): void {
     if (!parsed || typeof parsed !== 'object') return;
     const payload = parsed as {
@@ -131,7 +125,7 @@ class FilecoinMemoryStore {
     } catch (err) {
       if (!this.isTransientRpcError(err)) throw err;
       if (label === 'upload' && this.isPartialCommitError(err)) {
-        console.warn(`[CSMA-Filecoin] ${label} reached provider but commit failed; trying alternate provider path:`, err instanceof Error ? err.message : err);
+        console.warn(`[CSMA-Filecoin] ${label} reached provider but commit failed; queue retry required:`, err instanceof Error ? err.message : err);
         throw err;
       }
       console.warn(`[CSMA-Filecoin] ${label} RPC failed, retrying once:`, err instanceof Error ? err.message : err);
@@ -140,18 +134,67 @@ class FilecoinMemoryStore {
     }
   }
 
-  private async uploadWithProviderFallback(synapse: Awaited<ReturnType<typeof createWalletSynapse>>['synapse'], data: Uint8Array) {
-    const configuredProviderIds = await getFilecoinProviderIds();
+  private async uploadWithConfiguredProvider(synapse: Awaited<ReturnType<typeof createWalletSynapse>>['synapse'], data: Uint8Array) {
+    const configuredProviderId = await getFilecoinProviderId();
     const storageCopies = await getFilecoinStorageCopies();
+    if (configuredProviderId != null) {
+      console.log('[CSMA-Filecoin] configured provider:', configuredProviderId.toString(), ', copies: 1');
+      const [context] = await synapse.storage.createContexts({
+        providerIds: [configuredProviderId],
+        copies: 1,
+      });
+      if (!context) {
+        throw new Error(`Configured Filecoin provider ${configuredProviderId.toString()} did not resolve to a storage context.`);
+      }
+
+      const actualProviderId = context.provider.id;
+      if (actualProviderId !== configuredProviderId) {
+        throw new Error(
+          `Configured Filecoin provider ${configuredProviderId.toString()} resolved to provider ${actualProviderId.toString()}; refusing to upload outside FILECOIN_PROVIDER_ID.`,
+        );
+      }
+
+      console.log('[CSMA-Filecoin] selected provider:', actualProviderId.toString(), context.provider.pdp?.serviceURL || '');
+      let submittedTxHash: string | null = null;
+      let storedPieceCid: Parameters<typeof context.getPieceUrl>[0] | null = null;
+
+      try {
+        return await this.withRpcRetry('upload', () => synapse.storage.upload(data, {
+          contexts: [context],
+          callbacks: {
+            onStored: (providerId: bigint, pieceCid: Parameters<typeof context.getPieceUrl>[0]) => {
+              storedPieceCid = pieceCid;
+              console.log('[CSMA-Filecoin] stored on provider:', providerId.toString(), String(pieceCid));
+            },
+            onPiecesAdded: (txHash: string, providerId: bigint) => {
+              submittedTxHash = txHash;
+              console.log('[CSMA-Filecoin] commit tx submitted:', txHash, 'provider:', providerId.toString());
+            },
+            onPiecesConfirmed: (dataSetId: bigint, providerId: bigint) => {
+              console.log('[CSMA-Filecoin] commit confirmed:', 'dataset=' + dataSetId.toString(), 'provider=' + providerId.toString());
+            },
+          },
+        }));
+      } catch (err) {
+        if (!this.isPartialCommitError(err) || !submittedTxHash || !storedPieceCid) throw err;
+        console.warn('[CSMA-Filecoin] commit confirmation failed after tx submission; attempting status recovery:', submittedTxHash);
+        try {
+          return await this.recoverSubmittedCommit(context, storedPieceCid, submittedTxHash, data.byteLength);
+        } catch (recoveryErr) {
+          console.warn('[CSMA-Filecoin] commit status recovery failed:', recoveryErr instanceof Error ? recoveryErr.message : recoveryErr);
+          throw err;
+        }
+      }
+    }
+
     console.log(
-      '[CSMA-Filecoin] configured providers:',
-      configuredProviderIds.length > 0 ? configuredProviderIds.map((id) => id.toString()).join(',') : 'auto',
+      '[CSMA-Filecoin] configured provider:',
+      'auto',
       ', copies:',
       storageCopies,
     );
-    const uploadOptions = (providerIds: bigint[]) => ({
+    const uploadOptions = () => ({
       copies: storageCopies,
-      ...(providerIds.length > 0 ? { providerIds } : {}),
       callbacks: {
         onProviderSelected: (provider: { id: bigint; pdp?: { serviceURL?: string } }) => {
           console.log('[CSMA-Filecoin] selected provider:', provider.id.toString(), provider.pdp?.serviceURL || '');
@@ -159,19 +202,54 @@ class FilecoinMemoryStore {
       },
     });
 
-    try {
-      return await this.withRpcRetry('upload', () => synapse.storage.upload(data, uploadOptions(configuredProviderIds)));
-    } catch (err) {
-      if (!this.isPartialCommitError(err)) throw err;
-      const failedProviderId = this.extractFailedProviderId(err);
-      if (failedProviderId == null || configuredProviderIds.length === 0) throw err;
+    return await this.withRpcRetry('upload', () => synapse.storage.upload(data, uploadOptions()));
+  }
 
-      const nextProviderIds = configuredProviderIds.filter((id) => id !== failedProviderId);
-      if (nextProviderIds.length === configuredProviderIds.length || nextProviderIds.length === 0) throw err;
+  private async recoverSubmittedCommit(
+    context: Awaited<ReturnType<Awaited<ReturnType<typeof createWalletSynapse>>['synapse']['storage']['createContexts']>>[number],
+    pieceCid: Parameters<typeof context.getPieceUrl>[0],
+    txHash: string,
+    size: number,
+  ) {
+    const sp = await import('@filoz/synapse-core/sp');
+    const providerId = context.provider.id;
+    const serviceUrl = context.provider.pdp.serviceURL;
+    let dataSetId = context.dataSetId;
+    let pieceId: bigint | undefined;
+    let isNewDataSet = false;
 
-      console.warn('[CSMA-Filecoin] retrying upload with configured provider removed:', failedProviderId.toString());
-      return await this.withRpcRetry('upload-alt-provider', () => synapse.storage.upload(data, uploadOptions(nextProviderIds)));
+    if (dataSetId == null) {
+      const statusUrl = new URL(`/pdp/data-sets/created/${txHash}`, serviceUrl).toString();
+      console.log('[CSMA-Filecoin] recovering create-and-add status:', statusUrl);
+      const created = await sp.waitForCreateDataSet({ statusUrl, retryCount: 4, retryDelay: 2_000 });
+      dataSetId = created.dataSetId;
+      isNewDataSet = true;
     }
+
+    const addedStatusUrl = new URL(`/pdp/data-sets/${dataSetId.toString()}/pieces/added/${txHash}`, serviceUrl).toString();
+    console.log('[CSMA-Filecoin] recovering add-pieces status:', addedStatusUrl);
+    const added = await sp.waitForAddPieces({ statusUrl: addedStatusUrl, retryCount: 4, retryDelay: 2_000 });
+    pieceId = added.confirmedPieceIds[0];
+    if (pieceId == null) throw new Error('Recovered commit did not include a confirmed piece id.');
+
+    console.log('[CSMA-Filecoin] commit recovery confirmed:', 'dataset=' + dataSetId.toString(), 'provider=' + providerId.toString());
+    return {
+      pieceCid,
+      size,
+      requestedCopies: 1,
+      complete: true,
+      copies: [
+        {
+          providerId,
+          dataSetId,
+          pieceId,
+          role: 'primary' as const,
+          retrievalUrl: context.getPieceUrl(pieceCid),
+          isNewDataSet,
+        },
+      ],
+      failedAttempts: [],
+    };
   }
 
   private readRegistry(): SessionRegistry {
@@ -366,7 +444,7 @@ class FilecoinMemoryStore {
       }
 
       console.log('[CSMA-Filecoin] uploading...');
-      const result = await this.uploadWithProviderFallback(synapse, data);
+      const result = await this.uploadWithConfiguredProvider(synapse, data);
       console.log('[CSMA-Filecoin] upload OK — PieceCID:', result.pieceCid, ', copies:', result.copies.length);
       const primaryCopy = result.copies[0];
       const existing = await this.readRegistryEntry(sessionId, ownerId);
@@ -527,6 +605,10 @@ function normalizeChatTurns(turns: ChatTurn[]): ChatTurn[] {
 function nextTurnIndex(turns: ChatTurn[]): number {
   if (turns.length === 0) return 0;
   return Math.max(...turns.map((turn) => turn.turnIndex)) + 1;
+}
+
+function isRetryableBackupReason(reason: string): boolean {
+  return /data is stored but not on-chain|Failed to commit on primary provider|Failed to commit pieces on-chain|StorageContext commit failed|Network request failed|fetch failed|timeout/i.test(reason);
 }
 
 function backupQueueMessage(
@@ -727,6 +809,9 @@ export class MemoryManager {
       console.log('[CSMA-Filecoin] queue backup complete: session=' + message.sessionId.slice(0, 8) + '..., turns=' + result.turnIndexes.length);
     } else if (result.reason) {
       console.warn('[CSMA-Filecoin] queue backup skipped/failed: session=' + message.sessionId.slice(0, 8) + '..., reason=' + result.reason);
+      if (isRetryableBackupReason(result.reason)) {
+        throw new Error(result.reason);
+      }
     }
     return result;
   }

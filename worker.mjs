@@ -39,7 +39,7 @@ export default {
         message.ack?.();
       } catch (err) {
         console.error('[CSMA-Filecoin] queue message failed:', err);
-        message.retry?.();
+        message.retry?.({ delaySeconds: 10 });
       }
     }
   },

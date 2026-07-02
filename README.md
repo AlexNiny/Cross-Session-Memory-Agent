@@ -12,6 +12,7 @@ Built for the FilecoinTLDR Builder Challenge - Cycle 2.
 - Keeps chat text out of D1. Conversation content lives in the browser first, then in Filecoin backups.
 - Stores only indexes and configuration in D1, including Filecoin dataset IDs, PieceCIDs, synced turn indexes, auth sessions, provider settings, and encrypted session keys.
 - Restores backed-up conversations on another browser/device by reading D1's Filecoin index and downloading the corresponding pieces from Filecoin.
+- Runs Filecoin backups asynchronously through Cloudflare Queues, with retry handling and post-submit commit recovery for transient PDP/RPC failures.
 
 ## Architecture
 
@@ -37,9 +38,13 @@ Cloudflare Worker / OpenNext
         |
         +--> User-configured LLM provider
         |
-        +--> Filecoin via Synapse SDK
-              - encrypted app transport is not assumed
+        +--> Cloudflare Queue: filecoin-backups
+              |
+              v
+              Filecoin Warm Storage via Synapse SDK
               - chat turn batches are uploaded as Filecoin pieces
+              - optional single PDP provider pinning
+              - commit status recovery after tx submission
 ```
 
 ## Storage Model
@@ -110,7 +115,9 @@ The app can back up turns in two ways:
 
 Backups are queued asynchronously so chat responses are not blocked by Filecoin upload work. After a successful upload, the Memory page shows the latest PieceCID and backup history.
 
-On Cloudflare, Filecoin backup work is processed by Cloudflare Queues instead of `ctx.waitUntil()`. This avoids the 30-second post-response `waitUntil()` limit for long Filecoin prepare/upload operations.
+On Cloudflare, Filecoin backup work is processed by Cloudflare Queues instead of `ctx.waitUntil()`. This avoids the 30-second post-response `waitUntil()` limit for long Filecoin prepare/upload operations. Retryable PDP/RPC commit failures return a failed queue response so the message is retried instead of being acknowledged as complete.
+
+If the PDP provider returns a commit transaction hash but the first status poll fails, the worker performs a recovery check against the provider status endpoints. A recovered commit is treated as a successful backup and written into the D1 Filecoin registry.
 
 ### 6. Restore on another browser or device
 
@@ -191,16 +198,50 @@ pnpm cf:deploy
 
 The Worker entrypoint is `worker.mjs`, which wraps the OpenNext Worker for HTTP requests and exports a Queue consumer for Filecoin backup jobs.
 
+### Queue Behavior
+
+`worker.mjs` consumes the `filecoin-backups` queue and forwards each job to the internal backup API route. Failed jobs call `message.retry({ delaySeconds: 10 })`; the queue consumer is configured with `max_retries: 3` in `wrangler.jsonc`.
+
+This is intentionally used for Filecoin uploads because backups can include account preparation, upload, chain commit, and provider status polling. These operations are too long and too failure-prone for a normal chat request or a short `waitUntil()` task.
+
 ### Filecoin Provider Tuning
 
-If you want to use only specific Calibration PDP providers during upload, set:
+To store backups with one specific Calibration PDP provider, set:
 
 ```bash
-FILECOIN_PROVIDER_IDS=1,2
-FILECOIN_STORAGE_COPIES=2
+FILECOIN_PROVIDER_ID=2
+FILECOIN_STORAGE_COPIES=1
+```
+Check active providers: [Providers](https://filecoin.cloud/service-providers?chain=314159&sort=serviceOffered.desc)
+
+When `FILECOIN_PROVIDER_ID` is set, the backup worker creates a storage context for exactly that provider, verifies the resolved provider ID, and uploads a single copy through that context. It will not fall back to another provider.
+
+Leave `FILECOIN_PROVIDER_ID` empty to let Synapse choose providers automatically. In automatic mode, `FILECOIN_STORAGE_COPIES` controls the requested copy count.
+
+The default Cloudflare config currently pins Calibration provider `2` and requests one copy:
+
+```jsonc
+"FILECOIN_PROVIDER_ID": "2",
+"FILECOIN_STORAGE_COPIES": "1"
 ```
 
-`FILECOIN_PROVIDER_IDS` is a comma-separated allowlist of provider IDs. Leave it empty to let Synapse choose providers automatically. When a configured primary provider returns `data is stored but not on-chain` / `Failed to commit pieces on-chain`, the backup worker retries once using the remaining configured providers.
+Typical successful backup logs look like:
+
+```text
+[CSMA-Filecoin] configured provider: 2 , copies: 1
+[CSMA-Filecoin] selected provider: 2 https://calib2.ezpdpz.net
+[CSMA-Filecoin] stored on provider: 2 bafk...
+[CSMA-Filecoin] commit tx submitted: 0x... provider: 2
+[CSMA-Filecoin] commit confirmed: dataset=... provider=2
+```
+
+When the first status poll fails after a transaction was submitted, recovery logs may appear:
+
+```text
+[CSMA-Filecoin] commit confirmation failed after tx submission; attempting status recovery: 0x...
+[CSMA-Filecoin] recovering add-pieces status: https://...
+[CSMA-Filecoin] commit recovery confirmed: dataset=... provider=2
+```
 
 ## Filecoin Test Funds
 
@@ -219,6 +260,7 @@ src/
     api/
       auth/                 wallet login/session APIs
       chat/                 chat, Filecoin authorization, funding APIs
+      internal/             Queue-only Filecoin backup worker endpoint
       memory/               Filecoin registry and restore/backup APIs
       user/                 provider config APIs
     memory/                 memory/backup overview page
@@ -227,9 +269,9 @@ src/
   lib/
     agent.ts                LLM request orchestration
     auth.ts                 wallet auth/session helpers
-    cloudflare-env.ts       Worker/D1/background task helpers
+    cloudflare-env.ts       Worker/D1/Queue environment helpers
     crypto.ts               app-level encryption helpers
-    memory-manager.ts       local transcript, Filecoin backup, restore logic
+    memory-manager.ts       local transcript, Filecoin backup, commit recovery, restore logic
     provider-url.ts         provider URL validation
     synapse.ts              Synapse SDK/session-key/funding logic
     user-config.ts          per-user provider config persistence

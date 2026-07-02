@@ -3,6 +3,7 @@ import 'server-only';
 import { getCloudflareEnv } from './cloudflare-env';
 
 type RuntimeConfigKey =
+  | 'FILECOIN_PROVIDER_ID'
   | 'FILECOIN_PROVIDER_IDS'
   | 'FILECOIN_STORAGE_COPIES'
   | 'FILECOIN_RPC_URL'
@@ -27,6 +28,11 @@ function parseProviderIds(value: string | undefined): bigint[] {
     .map((entry) => entry.trim())
     .filter(Boolean)
     .map((entry) => BigInt(entry));
+}
+
+function parseProviderId(value: string | undefined): bigint | null {
+  const trimmed = value?.trim();
+  return trimmed ? BigInt(trimmed) : null;
 }
 
 function parseStorageCopies(value: string | undefined): number {
@@ -54,8 +60,8 @@ export const config = {
   get synapseSource() {
     return process.env.SYNAPSE_SOURCE || 'cross-session-memory-agent';
   },
-  get filecoinProviderIds() {
-    return parseProviderIds(process.env.FILECOIN_PROVIDER_IDS);
+  get filecoinProviderId() {
+    return parseProviderId(process.env.FILECOIN_PROVIDER_ID);
   },
   get filecoinStorageCopies() {
     return parseStorageCopies(process.env.FILECOIN_STORAGE_COPIES);
@@ -73,8 +79,12 @@ export const config = {
 
 export type AppConfig = typeof config;
 
-export async function getFilecoinProviderIds(): Promise<bigint[]> {
-  return parseProviderIds(await getRuntimeConfigValue('FILECOIN_PROVIDER_IDS'));
+export async function getFilecoinProviderId(): Promise<bigint | null> {
+  const singleProvider = parseProviderId(await getRuntimeConfigValue('FILECOIN_PROVIDER_ID'));
+  if (singleProvider != null) return singleProvider;
+
+  const legacyProviders = parseProviderIds(await getRuntimeConfigValue('FILECOIN_PROVIDER_IDS'));
+  return legacyProviders[0] ?? null;
 }
 
 export async function getFilecoinStorageCopies(): Promise<number> {
